@@ -1,0 +1,23 @@
+{
+  "type": "error",
+  "status": 409,
+  "code": "item_name_in_use",
+  "context_info": {
+    "conflicts": {
+      "type": "file",
+      "id": "4481073417331",
+      "file_version": {
+        "type": "file_version",
+        "id": "5326087464698",
+        "sha1": "fbfde6f1adf2137961152cd0fc2f040a1faec6fd"
+      },
+      "sequence_id": "0",
+      "etag": "0",
+      "sha1": "fbfde6f1adf2137961152cd0fc2f040a1faec6fd",
+      "name": "file-xyz.xlsx"
+    }
+  },
+  "help_url": "http://developers.box.com/docs/#errors",
+  "message": "Item with the same name already exists",
+  "request_id": "hfuahfuafuafuA"
+}
