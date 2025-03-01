@@ -6,7 +6,7 @@
 
   <groupId>com.eoral</groupId>
   <artifactId>copy-box-folder</artifactId>
-  <version>0.1</version>
+  <version>0.2</version>
 
   <name>copy-box-folder</name>
 
@@ -72,17 +72,20 @@
       </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-shade-plugin</artifactId>
-        <version>3.5.2</version>
-        <configuration>
-          <createDependencyReducedPom>false</createDependencyReducedPom>
-        </configuration>
+        <artifactId>maven-dependency-plugin</artifactId>
+        <version>3.6.1</version>
         <executions>
           <execution>
-            <phase>package</phase>
+            <id>copy-dependencies</id>
+            <phase>prepare-package</phase>
             <goals>
-              <goal>shade</goal>
+              <goal>copy-dependencies</goal>
             </goals>
+            <configuration>
+              <outputDirectory>
+                ${project.build.directory}/libs
+              </outputDirectory>
+            </configuration>
           </execution>
         </executions>
       </plugin>

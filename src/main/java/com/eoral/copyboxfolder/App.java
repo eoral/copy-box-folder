@@ -4,18 +4,28 @@ import com.box.sdk.*;
 import com.fasterxml.jackson.databind.JsonNode;
 
 import java.io.*;
+import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
-import java.util.Properties;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
+import java.time.*;
+import java.time.format.DateTimeFormatter;
+import java.time.temporal.ChronoUnit;
+import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 public class App {
 
+    private ExecutorService executor = null;
+
     public static void main(String[] args) {
 
+        long startTime = System.currentTimeMillis();
         App app = new App();
         Properties properties = app.loadProperties();
+
         String boxConfigJsonStrToAccessSourceFolder = app.getFileContentAsString("box-config-to-access-source-folder.json");
         String sourceFolderId = properties.getProperty("sourceFolderId");
         String boxConfigJsonStrToAccessTargetFolder = app.getFileContentAsString("box-config-to-access-target-folder.json");
@@ -25,12 +35,19 @@ public class App {
         BoxDeveloperEditionAPIConnection sourceApi = app.createApi(boxConfigJsonStrToAccessSourceFolder);
         BoxDeveloperEditionAPIConnection targetApi = app.createApi(boxConfigJsonStrToAccessTargetFolder);
 
-        long start = System.currentTimeMillis();
-        List<BoxItemMapping> boxItemMappingList = new ArrayList<>();
-        app.copyChildItems(sourceApi, sourceFolderId, targetApi, targetFolderId, boxItemMappingList);
-        long end = System.currentTimeMillis();
-        System.out.println("\n\nCompleted in " + (end - start) + " milliseconds\n");
-        System.out.println(Utils.convertToJsonString(boxItemMappingList));
+        app.initExecutor(properties);
+        List<BoxItemMapping> boxItemMappingList = Collections.synchronizedList(new ArrayList<>());
+
+        try {
+            app.copyChildItems(sourceApi, sourceFolderId, targetApi, targetFolderId, boxItemMappingList);
+        } finally {
+            app.shutdownExecutorAndAwaitTermination(properties);
+            long endTime = System.currentTimeMillis();
+            Duration duration = Duration.of(endTime - startTime, ChronoUnit.MILLIS);
+            System.out.println("\n\nCompleted in " + duration.toMinutes() + " minutes\n");
+            Path exportFilePath = app.exportBoxItemMappingListToFile(boxItemMappingList);
+            System.out.println("Output file is here: " + exportFilePath.toAbsolutePath());
+        }
     }
 
     private Properties loadProperties() {
@@ -57,6 +74,55 @@ public class App {
         return BoxDeveloperEditionAPIConnection.getAppEnterpriseConnection(boxConfig, accessTokenCache);
     }
 
+    private void initExecutor(Properties properties) {
+        int numberOfThreads = Integer.parseInt(properties.getProperty("numberOfThreadsForCopyingFiles"));
+        executor = Executors.newFixedThreadPool(numberOfThreads);
+    }
+
+    /**
+     * This code is taken from https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/ExecutorService.html
+     * Only timeouts are changed.
+     */
+    private void shutdownExecutorAndAwaitTermination(Properties properties) {
+        System.out.println("Waiting threads to finish...");
+        int timeoutInHours = Integer.parseInt(properties.getProperty("timeoutInHours"));
+        executor.shutdown(); // Disable new tasks from being submitted
+        try {
+            // Wait a while for existing tasks to terminate
+            if (!executor.awaitTermination(timeoutInHours, TimeUnit.HOURS)) {
+                executor.shutdownNow(); // Cancel currently executing tasks
+                // Wait a while for tasks to respond to being cancelled
+                if (!executor.awaitTermination(60, TimeUnit.SECONDS)) {
+                    System.err.println("Executor did not terminate");
+                }
+            }
+        } catch (InterruptedException ex) {
+            // (Re-)Cancel if current thread also interrupted
+            executor.shutdownNow();
+            // Preserve interrupt status
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private Path exportBoxItemMappingListToFile(List<BoxItemMapping> boxItemMappingList) {
+        String userHomeDirectory = System.getProperty("user.home");
+        String fileName = generateExportFileName();
+        Path filePath = Paths.get(userHomeDirectory, fileName);
+        try {
+            Files.writeString(filePath, Utils.convertToJsonString(boxItemMappingList),
+                    StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+        return filePath;
+    }
+
+    private String generateExportFileName() {
+        Instant timestamp = Instant.now();
+        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyyMMdd'-'HHmmss").withZone(ZoneId.systemDefault());
+        return "copy-box-folder-output-" + formatter.format(timestamp) + ".json";
+    }
+
     private void copyChildItems(
             BoxDeveloperEditionAPIConnection sourceApi, String sourceFolderId,
             BoxDeveloperEditionAPIConnection targetApi, String targetFolderId,
@@ -71,7 +137,6 @@ public class App {
             } else {
                 for (BoxItem.Info sourceItemInfo: itemCollection) {
                     copyItem(sourceApi, sourceItemInfo, targetApi, targetFolderId, boxItemMappingList);
-                    System.out.print(".");
                 }
                 if (itemCollection.size() < limit) {
                     break;
@@ -88,13 +153,18 @@ public class App {
         if (sourceItemInfo instanceof BoxFile.Info) {
             String fileId = sourceItemInfo.getID();
             String fileName = sourceItemInfo.getName();
-            String copiedFileId = copyFileIfNotExists(sourceApi, fileId, fileName, targetApi, targetFolderId);
-            boxItemMappingList.add(new BoxItemMapping(BoxItemType.FILE, fileId, copiedFileId));
+            long fileSize = sourceItemInfo.getSize();
+            executor.submit(() -> {
+                String copiedFileId = copyFileIfNotExists(sourceApi, fileId, fileName, fileSize, targetApi, targetFolderId);
+                boxItemMappingList.add(new BoxItemMapping(BoxItemType.FILE, fileId, copiedFileId));
+                System.out.println("File copied or already exists - sourceId: " + fileId + ", targetId: " + copiedFileId);
+            });
         } else if (sourceItemInfo instanceof BoxFolder.Info) {
             String folderId = sourceItemInfo.getID();
             String folderName = sourceItemInfo.getName();
             String createdFolderId = createFolderIfNotExists(targetApi, targetFolderId, folderName);
             boxItemMappingList.add(new BoxItemMapping(BoxItemType.FOLDER, folderId, createdFolderId));
+            System.out.println("Folder created or already exists - sourceId: " + folderId + ", targetId: " + createdFolderId);
             copyChildItems(sourceApi, folderId, targetApi, createdFolderId, boxItemMappingList);
         }
     }
@@ -102,45 +172,30 @@ public class App {
     /**
      * Use copyFileIfNotExists method, it is faster.
      */
+    @Deprecated
     private String copyFileIfNotExistsUsingSearchMethod(
-            BoxDeveloperEditionAPIConnection sourceApi, String sourceFileId, String sourceFileName,
+            BoxDeveloperEditionAPIConnection sourceApi, String sourceFileId, String sourceFileName, long sourceFileSize,
             BoxDeveloperEditionAPIConnection targetApi, String targetFolderId) {
         BoxItem.Info foundFileInfo = findFile(targetApi, targetFolderId, sourceFileName);
         if (foundFileInfo != null) {
             return foundFileInfo.getID();
         } else {
-            Path filePath = null;
-            try {
-                filePath = Utils.createTempFile();
-                downloadFile(sourceApi, sourceFileId, filePath);
-                BoxFile.Info uploadedFileInfo = uploadFile(targetApi, targetFolderId, sourceFileName, filePath);
-                return uploadedFileInfo.getID();
-            } finally {
-                if (filePath != null) {
-                    Utils.deleteFile(filePath);
-                }
-            }
+            return downloadFromSourceAndUploadToTarget(
+                    sourceApi, sourceFileId, sourceFileName, sourceFileSize,
+                    targetApi, targetFolderId);
         }
     }
 
     private String copyFileIfNotExists(
-            BoxDeveloperEditionAPIConnection sourceApi, String sourceFileId, String sourceFileName,
+            BoxDeveloperEditionAPIConnection sourceApi, String sourceFileId, String sourceFileName, long sourceFileSize,
             BoxDeveloperEditionAPIConnection targetApi, String targetFolderId) {
         String foundFileId = findFileIdUsingCanUploadMethod(targetApi, targetFolderId, sourceFileName);
         if (foundFileId != null) {
             return foundFileId;
         } else {
-            Path filePath = null;
-            try {
-                filePath = Utils.createTempFile();
-                downloadFile(sourceApi, sourceFileId, filePath);
-                BoxFile.Info uploadedFileInfo = uploadFile(targetApi, targetFolderId, sourceFileName, filePath);
-                return uploadedFileInfo.getID();
-            } finally {
-                if (filePath != null) {
-                    Utils.deleteFile(filePath);
-                }
-            }
+            return downloadFromSourceAndUploadToTarget(
+                    sourceApi, sourceFileId, sourceFileName, sourceFileSize,
+                    targetApi, targetFolderId);
         }
     }
 
@@ -198,6 +253,40 @@ public class App {
         }
     }
 
+    private String downloadFromSourceAndUploadToTarget(
+            BoxDeveloperEditionAPIConnection sourceApi, String sourceFileId, String sourceFileName, long sourceFileSize,
+            BoxDeveloperEditionAPIConnection targetApi, String targetFolderId) {
+        if (sourceFileSize <= 104857600) { // 100 MB
+            return downloadFromSourceAndUploadToTargetUsingMemory(sourceApi, sourceFileId, sourceFileName, targetApi, targetFolderId);
+        } else {
+            return downloadFromSourceAndUploadToTargetUsingTempFile(sourceApi, sourceFileId, sourceFileName, targetApi, targetFolderId);
+        }
+    }
+
+    private String downloadFromSourceAndUploadToTargetUsingMemory(
+            BoxDeveloperEditionAPIConnection sourceApi, String sourceFileId, String sourceFileName,
+            BoxDeveloperEditionAPIConnection targetApi, String targetFolderId) {
+        byte[] bytes = downloadFile(sourceApi, sourceFileId);
+        BoxFile.Info uploadedFileInfo = uploadFile(targetApi, targetFolderId, sourceFileName, bytes);
+        return uploadedFileInfo.getID();
+    }
+
+    private String downloadFromSourceAndUploadToTargetUsingTempFile(
+            BoxDeveloperEditionAPIConnection sourceApi, String sourceFileId, String sourceFileName,
+            BoxDeveloperEditionAPIConnection targetApi, String targetFolderId) {
+        Path filePath = null;
+        try {
+            filePath = Utils.createTempFile();
+            downloadFile(sourceApi, sourceFileId, filePath);
+            BoxFile.Info uploadedFileInfo = uploadFile(targetApi, targetFolderId, sourceFileName, filePath);
+            return uploadedFileInfo.getID();
+        } finally {
+            if (filePath != null) {
+                Utils.deleteFile(filePath);
+            }
+        }
+    }
+
     private void downloadFile(BoxDeveloperEditionAPIConnection api, String fileId, Path filePath) {
         BoxFile file = new BoxFile(api, fileId);
         try (FileOutputStream outputStream = new FileOutputStream(filePath.toFile())) {
@@ -207,9 +296,28 @@ public class App {
         }
     }
 
+    private byte[] downloadFile(BoxDeveloperEditionAPIConnection api, String fileId) {
+        BoxFile file = new BoxFile(api, fileId);
+        try (ByteArrayOutputStream outputStream = new ByteArrayOutputStream()) {
+            file.download(outputStream);
+            return outputStream.toByteArray();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
     private BoxFile.Info uploadFile(BoxDeveloperEditionAPIConnection api, String parentFolderId, String fileName, Path filePath) {
         BoxFolder parentFolder = new BoxFolder(api, parentFolderId);
         try (FileInputStream inputStream = new FileInputStream(filePath.toFile())) {
+            return parentFolder.uploadFile(inputStream, fileName);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    private BoxFile.Info uploadFile(BoxDeveloperEditionAPIConnection api, String parentFolderId, String fileName, byte[] bytes) {
+        BoxFolder parentFolder = new BoxFolder(api, parentFolderId);
+        try (ByteArrayInputStream inputStream = new ByteArrayInputStream(bytes)) {
             return parentFolder.uploadFile(inputStream, fileName);
         } catch (IOException e) {
             throw new UncheckedIOException(e);
